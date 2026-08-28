@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Animated,
+  Alert,
   Platform,
   Pressable,
   ScrollView,
@@ -14,11 +15,24 @@ import * as KeepAwake from 'expo-keep-awake';
 import * as Location from 'expo-location';
 
 import {
-  analyzeSegment,
   formatElapsed,
   formatPaceFromSpeed,
-  type TrackPoint,
 } from './src/runMath';
+import {
+  canTrackInBackground,
+  elapsedMilliseconds,
+  EMPTY_RUN_SNAPSHOT,
+  LIVE_LOCATION_OPTIONS,
+  loadRunSnapshot,
+  pauseRunSession,
+  recordLocations,
+  resetRunSession,
+  resumeRunSession,
+  startBackgroundLocationUpdates,
+  stopBackgroundLocationUpdates,
+  subscribeRunSnapshot,
+  type RunSnapshot,
+} from './src/locationTracking';
 
 const COLORS = {
   asphalt: '#0B1114',
@@ -35,7 +49,6 @@ const COLORS = {
 
 const KEEP_AWAKE_TAG = 'runexa-live-run';
 const MAX_ACCURACY_METERS = 35;
-const SPEED_SAMPLE_COUNT = 5;
 
 type TrackerState =
   | 'ready'
@@ -45,27 +58,17 @@ type TrackerState =
   | 'paused'
   | 'error';
 
-type LiveMetrics = {
-  accuracyMeters: number | null;
-  distanceMeters: number;
-  latitude: number | null;
-  longitude: number | null;
-  speedMps: number;
-};
-
-const INITIAL_METRICS: LiveMetrics = {
-  accuracyMeters: null,
-  distanceMeters: 0,
-  latitude: null,
-  longitude: null,
-  speedMps: 0,
-};
+type TrackingMode = 'background' | 'foreground' | null;
 
 const displayFont = Platform.select({ android: 'sans-serif-condensed', default: 'System' });
 
 function averagePace(distanceMeters: number, elapsedMs: number): string {
   if (distanceMeters < 10 || elapsedMs <= 0) return '—';
   return formatPaceFromSpeed(distanceMeters / (elapsedMs / 1000));
+}
+
+function formatDistanceKilometers(distanceMeters: number): string {
+  return (distanceMeters / 1000).toFixed(distanceMeters < 1000 ? 3 : 2);
 }
 
 function stateCopy(state: TrackerState, accuracy: number | null) {
@@ -80,94 +83,54 @@ function stateCopy(state: TrackerState, accuracy: number | null) {
   return { label: 'READY', tone: COLORS.mist };
 }
 
+function explainAndRequestBackgroundPermission(): Promise<boolean> {
+  return new Promise((resolve) => {
+    Alert.alert(
+      'Track when the screen is locked?',
+      'Runexa needs background location so distance keeps updating when you lock your phone or switch apps. You can continue with foreground-only tracking instead.',
+      [
+        { onPress: () => resolve(false), style: 'cancel', text: 'Keep app open' },
+        {
+          onPress: () => {
+            void Location.requestBackgroundPermissionsAsync()
+              .then((permission) => resolve(permission.granted))
+              .catch(() => resolve(false));
+          },
+          text: 'Continue',
+        },
+      ],
+      { cancelable: false },
+    );
+  });
+}
+
 export default function App() {
   const [trackerState, setTrackerState] = useState<TrackerState>('ready');
-  const [metrics, setMetrics] = useState<LiveMetrics>(INITIAL_METRICS);
-  const [elapsedMs, setElapsedMs] = useState(0);
+  const [runSnapshot, setRunSnapshot] = useState<RunSnapshot>(() => ({ ...EMPTY_RUN_SNAPSHOT }));
+  const [clockNow, setClockNow] = useState(Date.now());
+  const [trackingMode, setTrackingMode] = useState<TrackingMode>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const distanceRef = useRef(0);
-  const lastPointRef = useRef<TrackPoint | null>(null);
-  const speedSamplesRef = useRef<number[]>([]);
-  const startedAtRef = useRef<number | null>(null);
-  const accumulatedMsRef = useRef(0);
   const locationSubscriptionRef = useRef<Location.LocationSubscription | null>(null);
-  const clockRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pulse = useRef(new Animated.Value(0)).current;
 
+  const metrics = runSnapshot;
+  const elapsedMs = elapsedMilliseconds(runSnapshot, clockNow);
   const isTracking = trackerState === 'acquiring' || trackerState === 'running';
   const isBusy = trackerState === 'requesting';
   const hasRunData = elapsedMs > 0 || metrics.distanceMeters > 0;
 
-  const releaseActiveResources = useCallback((freezeClock: boolean) => {
-    if (freezeClock && startedAtRef.current !== null) {
-      accumulatedMsRef.current += Date.now() - startedAtRef.current;
-      setElapsedMs(accumulatedMsRef.current);
-    }
-    startedAtRef.current = null;
-
-    if (clockRef.current) {
-      clearInterval(clockRef.current);
-      clockRef.current = null;
-    }
-
+  const releaseForegroundResources = useCallback(() => {
     locationSubscriptionRef.current?.remove();
     locationSubscriptionRef.current = null;
-    lastPointRef.current = null;
-    speedSamplesRef.current = [];
     void KeepAwake.deactivateKeepAwake(KEEP_AWAKE_TAG).catch(() => undefined);
   }, []);
 
   const handleLocation = useCallback((location: Location.LocationObject) => {
-    const point: TrackPoint = {
-      accuracy: location.coords.accuracy,
-      latitude: location.coords.latitude,
-      longitude: location.coords.longitude,
-      speed: location.coords.speed,
-      timestamp: location.timestamp,
-    };
-
-    setMetrics((current) => ({
-      ...current,
-      accuracyMeters: point.accuracy,
-      latitude: point.latitude,
-      longitude: point.longitude,
-    }));
-
-    if (point.accuracy === null || point.accuracy > MAX_ACCURACY_METERS) {
-      speedSamplesRef.current = [];
-      setMetrics((current) => ({ ...current, speedMps: 0 }));
-      return;
-    }
-
-    if (!lastPointRef.current) {
-      lastPointRef.current = point;
-      setTrackerState('running');
-      return;
-    }
-
-    const segment = analyzeSegment(lastPointRef.current, point);
-    if (segment.shouldAdvance) lastPointRef.current = point;
-
-    if (!segment.accepted) {
-      if (segment.reason === 'stationary' || segment.reason === 'gap') {
-        speedSamplesRef.current = [];
-        setMetrics((current) => ({ ...current, speedMps: 0 }));
-      }
-      return;
-    }
-
-    distanceRef.current += segment.distanceMeters;
-    const samples = [...speedSamplesRef.current, segment.speedMps].slice(-SPEED_SAMPLE_COUNT);
-    speedSamplesRef.current = samples;
-    const smoothedSpeed = samples.reduce((sum, speed) => sum + speed, 0) / samples.length;
-
-    setMetrics((current) => ({
-      ...current,
-      distanceMeters: distanceRef.current,
-      speedMps: smoothedSpeed,
-    }));
-    setTrackerState('running');
+    void recordLocations([location]).catch((error: unknown) => {
+      setErrorMessage(error instanceof Error ? error.message : 'Could not save the GPS update.');
+      setTrackerState('error');
+    });
   }, []);
 
   const startTracking = useCallback(async () => {
@@ -179,63 +142,117 @@ export default function App() {
     try {
       const servicesEnabled = await Location.hasServicesEnabledAsync();
       if (!servicesEnabled) {
-        throw new Error('Turn on Location in Android settings, then try again.');
+        throw new Error('Turn on Location Services in your phone settings, then try again.');
       }
 
       const permission = await Location.requestForegroundPermissionsAsync();
       if (permission.status !== Location.PermissionStatus.GRANTED) {
-        throw new Error('Location access is required to measure your run. Allow it in Android settings.');
+        throw new Error('Location access is required to measure your run. Allow it in phone settings.');
+      }
+      if (Platform.OS === 'android' && permission.android?.accuracy !== 'fine') {
+        throw new Error('Runexa has approximate location only. Enable Precise location for Runexa in phone settings.');
+      }
+      if (Platform.OS === 'ios' && permission.ios?.accuracy === 'reduced') {
+        throw new Error('Runexa needs Precise Location enabled to calculate distance reliably.');
       }
 
+      if (Platform.OS === 'android') {
+        await Location.enableNetworkProviderAsync().catch(() => undefined);
+      }
+
+      const existingBackgroundPermission = await Location.getBackgroundPermissionsAsync();
+      const backgroundGranted = existingBackgroundPermission.granted
+        ? true
+        : await explainAndRequestBackgroundPermission();
+
       setTrackerState('acquiring');
-      startedAtRef.current = Date.now();
-      setElapsedMs(accumulatedMsRef.current);
-      clockRef.current = setInterval(() => {
-        if (startedAtRef.current !== null) {
-          setElapsedMs(accumulatedMsRef.current + Date.now() - startedAtRef.current);
-        }
-      }, 1000);
+      await resumeRunSession();
 
-      locationSubscriptionRef.current = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.High,
-          distanceInterval: 1,
-          timeInterval: 1000,
-          mayShowUserSettingsDialog: true,
-        },
-        handleLocation,
-        (reason) => {
-          releaseActiveResources(true);
-          setErrorMessage(`GPS stopped: ${reason}`);
-          setTrackerState('error');
-        },
-      );
-
-      await KeepAwake.activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      if (backgroundGranted && (await canTrackInBackground())) {
+        await startBackgroundLocationUpdates();
+        setTrackingMode('background');
+      } else {
+        locationSubscriptionRef.current = await Location.watchPositionAsync(
+          LIVE_LOCATION_OPTIONS,
+          handleLocation,
+          (reason) => {
+            releaseForegroundResources();
+            void pauseRunSession();
+            setErrorMessage(`GPS stopped: ${reason}`);
+            setTrackerState('error');
+          },
+        );
+        setTrackingMode('foreground');
+        await KeepAwake.activateKeepAwakeAsync(KEEP_AWAKE_TAG);
+      }
     } catch (error) {
-      releaseActiveResources(true);
+      releaseForegroundResources();
+      await stopBackgroundLocationUpdates().catch(() => undefined);
+      await pauseRunSession().catch(() => undefined);
+      setTrackingMode(null);
       setErrorMessage(error instanceof Error ? error.message : 'GPS could not be started.');
       setTrackerState('error');
     }
-  }, [handleLocation, isBusy, isTracking, releaseActiveResources]);
+  }, [handleLocation, isBusy, isTracking, releaseForegroundResources]);
 
-  const pauseTracking = useCallback(() => {
-    releaseActiveResources(true);
-    setMetrics((current) => ({ ...current, speedMps: 0 }));
+  const pauseTracking = useCallback(async () => {
+    releaseForegroundResources();
+    await stopBackgroundLocationUpdates().catch(() => undefined);
+    await pauseRunSession();
+    setTrackingMode(null);
     setTrackerState('paused');
-  }, [releaseActiveResources]);
+  }, [releaseForegroundResources]);
 
-  const resetRun = useCallback(() => {
+  const resetRun = useCallback(async () => {
     if (isTracking || isBusy) return;
-    accumulatedMsRef.current = 0;
-    distanceRef.current = 0;
-    lastPointRef.current = null;
-    speedSamplesRef.current = [];
-    setElapsedMs(0);
-    setMetrics(INITIAL_METRICS);
+    await resetRunSession();
+    setClockNow(Date.now());
     setErrorMessage(null);
     setTrackerState('ready');
   }, [isBusy, isTracking]);
+
+  useEffect(() => {
+    let mounted = true;
+    const applySnapshot = (snapshot: RunSnapshot) => {
+      if (!mounted) return;
+      setRunSnapshot(snapshot);
+      setClockNow(Date.now());
+      if (snapshot.active) {
+        setTrackerState(snapshot.updatedAt === null ? 'acquiring' : 'running');
+      } else if (elapsedMilliseconds(snapshot) > 0 || snapshot.distanceMeters > 0) {
+        setTrackerState('paused');
+      }
+    };
+    const unsubscribe = subscribeRunSnapshot(applySnapshot);
+    void loadRunSnapshot().then(async (snapshot) => {
+      applySnapshot(snapshot);
+      if (!snapshot.active) return;
+
+      try {
+        if (await canTrackInBackground()) {
+          await startBackgroundLocationUpdates();
+          setTrackingMode('background');
+        } else {
+          await pauseRunSession();
+          setTrackingMode(null);
+        }
+      } catch (error) {
+        await pauseRunSession().catch(() => undefined);
+        setErrorMessage(error instanceof Error ? error.message : 'The previous run could not be resumed.');
+        setTrackerState('error');
+      }
+    });
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!runSnapshot.active) return;
+    const clock = setInterval(() => setClockNow(Date.now()), 1000);
+    return () => clearInterval(clock);
+  }, [runSnapshot.active]);
 
   useEffect(() => {
     if (!isTracking) {
@@ -255,7 +272,7 @@ export default function App() {
     return () => animation.stop();
   }, [isTracking, pulse]);
 
-  useEffect(() => () => releaseActiveResources(false), [releaseActiveResources]);
+  useEffect(() => () => releaseForegroundResources(), [releaseForegroundResources]);
 
   const livePace = formatPaceFromSpeed(metrics.speedMps);
   const speedKmh = metrics.speedMps * 3.6;
@@ -313,7 +330,10 @@ export default function App() {
             {trackerState === 'ready' && 'Start outside with a clear view of the sky.'}
             {trackerState === 'requesting' && 'Waiting for location permission.'}
             {trackerState === 'acquiring' && 'Hold steady while GPS finds you.'}
-            {trackerState === 'running' && 'Updating from your phone every second.'}
+            {trackerState === 'running' && trackingMode === 'background' &&
+              'Live tracking stays active when the screen is locked.'}
+            {trackerState === 'running' && trackingMode !== 'background' &&
+              'Live every second. Keep Runexa open for this run.'}
             {trackerState === 'paused' && 'Your run is paused. Movement is not counted.'}
             {trackerState === 'error' && errorMessage}
           </Text>
@@ -327,7 +347,7 @@ export default function App() {
           <View style={styles.verticalRule} />
           <View style={styles.primaryStat}>
             <Text style={styles.statLabel}>DISTANCE</Text>
-            <Text style={styles.statValue}>{(metrics.distanceMeters / 1000).toFixed(2)}</Text>
+            <Text style={styles.statValue}>{formatDistanceKilometers(metrics.distanceMeters)}</Text>
             <Text style={styles.statUnit}>KM</Text>
           </View>
         </View>

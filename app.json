@@ -2,7 +2,7 @@
   "expo": {
     "name": "Runexa",
     "slug": "runexa",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -10,12 +10,17 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Allow Runexa to use your location while you track a run."
+          "locationAlwaysAndWhenInUsePermission": "Allow Runexa to measure your distance and pace during an active run, including when the screen is locked.",
+          "locationWhenInUsePermission": "Allow Runexa to use your precise location while you track a run.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true,
+          "isIosBackgroundLocationEnabled": true
         }
       ]
     ],
     "android": {
       "package": "com.yadavayush834.runexa",
+      "versionCode": 2,
       "adaptiveIcon": {
         "backgroundColor": "#0B1114",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -25,12 +30,16 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.ACCESS_FINE_LOCATION"
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.yadavayush834.runexa"
+      "bundleIdentifier": "com.yadavayush834.runexa",
+      "buildNumber": "2"
     },
     "extra": {
       "eas": {
