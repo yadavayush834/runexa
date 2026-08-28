@@ -1,7 +1,7 @@
 const EARTH_RADIUS_METERS = 6_371_000;
 const MAX_RUNNER_SPEED_MPS = 12;
-const MIN_MOVING_SPEED_MPS = 0.5;
-const MAX_SEGMENT_GAP_SECONDS = 5;
+const MIN_MOVING_SPEED_MPS = 0.35;
+const MAX_SEGMENT_GAP_SECONDS = 30;
 const MAX_ACCURACY_METERS = 35;
 
 export type TrackPoint = {
@@ -54,7 +54,14 @@ export function analyzeSegment(previous: TrackPoint, current: TrackPoint): Segme
   const distanceMeters = distanceBetweenMeters(previous, current);
   const derivedSpeed = distanceMeters / seconds;
   const sensorSpeed = current.speed !== null && current.speed >= 0 ? current.speed : null;
-  const speedMps = sensorSpeed ?? derivedSpeed;
+
+  // Android frequently reports a temporary native speed of exactly zero even
+  // while consecutive GPS fixes show clear walking/running movement. Treat a
+  // useful native reading as authoritative, but fall back to coordinate speed
+  // when the native value is absent or still below the movement threshold.
+  const speedMps = sensorSpeed !== null && sensorSpeed >= MIN_MOVING_SPEED_MPS
+    ? sensorSpeed
+    : derivedSpeed;
 
   if (speedMps > MAX_RUNNER_SPEED_MPS || derivedSpeed > MAX_RUNNER_SPEED_MPS * 1.35) {
     return { accepted: false, distanceMeters: 0, reason: 'jump', shouldAdvance: false, speedMps: 0 };
