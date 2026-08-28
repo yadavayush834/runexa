@@ -1,0 +1,41 @@
+{
+  "expo": {
+    "name": "Runexa",
+    "slug": "runexa",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Runexa to use your location while you track a run."
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.yadavayush834.runexa",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B1114",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.yadavayush834.runexa"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "c7daf154-2f31-46b8-ae1c-9988d418d676"
+      }
+    }
+  }
+}
